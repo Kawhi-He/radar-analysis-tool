@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local radar data and generated outputs
+frame.txt
+report.html
+tapp_versionfile.txt
