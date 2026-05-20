@@ -25,6 +25,15 @@ from typing import List
 
 
 HEAD_RE = re.compile(r"^\s*([A-Za-z]+)=([\-\d\.nan]+)\s*$")
+
+# ---------------------------------------------------------------------------
+# E-bike target filter thresholds
+# E-bike speed: 25–50 km/h  =>  6.94–13.89 m/s
+# Target must have first appeared at least this far away (meters).
+# ---------------------------------------------------------------------------
+EBIKE_MIN_SPEED_MPS: float = 25.0 / 3.6   # ~6.94 m/s
+EBIKE_MAX_SPEED_MPS: float = 50.0 / 3.6   # ~13.89 m/s
+EBIKE_MIN_APPEAR_DIST_M: float = 10.0     # first object distance threshold
 POINT_RE = re.compile(
     r"^\s*\d+:Range=([\-\d\.]+)\s+Velocity=([\-\d\.]+)\s+"
     r"AngleAZ=([\-\d\.]+)\s+AngleEL=([\-\d\.]+)\s+RCS=([\-\d\.]+)\s*$"
@@ -370,10 +379,17 @@ def infer_launch_frames(cycle: List[Frame], all_frames: List[Frame]) -> int:
     expected_angle = math.degrees(
         math.atan2(obj0.dist_long_m, max(abs(obj0.dist_lat_m), 1e-6))
     )
-    expected_v = obj0.vre_lat_mps
+    speed_mag = max(abs(obj0.vre_lat_mps), 1e-6)
+
+    # Range/velocity are used as hard constraints; angle is used as a soft
+    # penalty only to avoid rejecting valid launch points with noisy azimuth.
+    wr = 0.45
+    wv = 0.45
+    wa = 0.10
 
     launch_count = 0
     cumulative_time = 0.0
+    prev_selected_range = expected_range0
 
     for i in range(idx - 1, -1, -1):
         prev = all_frames[i]
@@ -384,38 +400,148 @@ def infer_launch_frames(cycle: List[Frame], all_frames: List[Frame]) -> int:
             dt = 0.1
         cumulative_time += dt
 
-        predicted_range = expected_range0 + expected_v * cumulative_time
-        range_tol = max(2.0, predicted_range * 0.22)
-        vel_tol = max(2.8, abs(expected_v) * 0.9)
-        angle_tol = 14.0
+        predicted_range = expected_range0 + speed_mag * cumulative_time
+        range_tol = max(2.0, predicted_range * 0.18 + 1.5)
+        vel_tol = max(1.5, speed_mag * 0.18)
+        min_speed = speed_mag * 0.55
 
-        found = False
+        best_score = None
+        best_point = None
+
         for p in prev.points:
-            dv = min(
-                abs(p.velocity_mps - expected_v),
-                abs(p.velocity_mps + expected_v),
-                abs(p.velocity_mps),
-            )
+            dr = abs(p.range_m - predicted_range)
+            point_speed = abs(p.velocity_mps)
+            dv = abs(point_speed - speed_mag)
             p_angle = math.degrees(p.angle_az_rad)
             da = min(
                 abs(p_angle - expected_angle),
                 abs(p_angle + expected_angle),
                 abs(abs(p_angle) - abs(expected_angle)),
             )
-            if (
-                abs(p.range_m - predicted_range) <= range_tol
-                and dv <= vel_tol
-                and da <= angle_tol
-            ):
-                found = True
-                break
 
-        if found:
-            launch_count += 1
-        else:
+            if dr > range_tol or dv > vel_tol or point_speed < min_speed:
+                continue
+
+            score = (
+                wr * (dr / max(range_tol, 1e-6))
+                + wv * (dv / max(vel_tol, 1e-6))
+                + wa * (min(da, 45.0) / 45.0)
+            )
+            if best_score is None or score < best_score:
+                best_score = score
+                best_point = p
+
+        if best_point is None:
             break
 
+        # Backward tracing for approaching targets should be non-decreasing in
+        # range with limited step jitter.
+        if best_point.range_m + 0.4 < prev_selected_range:
+            break
+        max_step = speed_mag * dt + 2.0
+        if abs(best_point.range_m - prev_selected_range) > max_step:
+            break
+
+        launch_count += 1
+        prev_selected_range = best_point.range_m
+
     return launch_count
+
+
+def is_ebike_cycle(cycle: List[Frame]) -> bool:
+    """
+    Overview:
+    Determine whether an object cycle matches an e-bike target profile.
+    Filters out pedestrian interference by requiring:
+    1. Target first appears at a far distance (>= EBIKE_MIN_APPEAR_DIST_M).
+    2. Median longitudinal speed magnitude falls within the e-bike range
+       [EBIKE_MIN_SPEED_MPS, EBIKE_MAX_SPEED_MPS].
+
+    Input Parameters:
+    - cycle (list[Frame]): One object appearance cycle.
+
+    Return Values:
+    - bool: True if the cycle looks like an e-bike target.
+    """
+
+    if not cycle:
+        return False
+
+    # Condition 1: farthest detected distance must exceed the appearance threshold
+    # (target entered the detection zone from far away).
+    object_dists = [abs(f.objects[0].dist_lat_m) for f in cycle if f.objects]
+    if not object_dists or max(object_dists) < EBIKE_MIN_APPEAR_DIST_M:
+        return False
+
+    # Condition 2: representative speed magnitude must be in the e-bike speed
+    # range. Use upper-quartile speed (P75) + peak speed instead of median to
+    # reduce false filtering when some frames are slowed by radial projection
+    # or temporary tracking jitter.
+    speeds = [
+        abs(f.objects[0].vre_lat_mps)
+        for f in cycle
+        if f.objects and not math.isnan(f.objects[0].vre_lat_mps)
+    ]
+    if not speeds:
+        return False
+
+    sorted_speeds = sorted(speeds)
+    mid = len(sorted_speeds) // 2
+    median_speed = (
+        sorted_speeds[mid]
+        if len(sorted_speeds) % 2 == 1
+        else (sorted_speeds[mid - 1] + sorted_speeds[mid]) / 2.0
+    )
+    p75_index = int((len(sorted_speeds) - 1) * 0.75)
+    p75_speed = sorted_speeds[p75_index]
+    peak_speed = sorted_speeds[-1]
+
+    return (
+        EBIKE_MIN_SPEED_MPS <= p75_speed <= EBIKE_MAX_SPEED_MPS
+        and peak_speed >= EBIKE_MIN_SPEED_MPS
+        and median_speed >= EBIKE_MIN_SPEED_MPS * 0.75
+    )
+
+
+def classify_motion_scene(cycle: List[Frame]) -> tuple[str, str, int]:
+    """
+    Overview:
+    Classify one cycle as approaching or receding by DistLat absolute trend.
+
+    Input Parameters:
+    - cycle (list[Frame]): One object appearance cycle.
+
+    Return Values:
+    - tuple[str, str, int]: (scene_key, scene_label, scene_priority).
+      Lower priority value means earlier display order.
+    """
+
+    dists = [abs(f.objects[0].dist_lat_m) for f in cycle if f.objects]
+    if len(dists) < 2:
+        return ("unknown", "趋势不明确", 2)
+
+    eps = 0.05
+    dec = 0
+    inc = 0
+    for prev, cur in zip(dists, dists[1:]):
+        delta = cur - prev
+        if delta < -eps:
+            dec += 1
+        elif delta > eps:
+            inc += 1
+
+    overall = dists[-1] - dists[0]
+    if dec >= inc and overall < -eps:
+        return ("approaching", "接近场景", 0)
+    if inc > dec and overall > eps:
+        return ("receding", "远离场景", 1)
+
+    # Fallback by start/end change direction.
+    if overall < 0:
+        return ("approaching", "接近场景", 0)
+    if overall > 0:
+        return ("receding", "远离场景", 1)
+    return ("unknown", "趋势不明确", 2)
 
 
 def missing_frame_ids_in_cycle(cycle: List[Frame]) -> List[int]:
@@ -450,12 +576,12 @@ def alarm_label(alarm_type: int) -> str:
     """
 
     if alarm_type == 0:
-        return "无报警 / None"
+        return "无报警"
     if alarm_type == 1:
-        return "左侧 / Left"
+        return "左侧"
     if alarm_type == 2:
-        return "右侧 / Right"
-    return f"未知({alarm_type}) / Unknown({alarm_type})"
+        return "右侧"
+    return f"未知({alarm_type})"
 
 
 def format_alarm_switches(switches: List[dict]) -> str:
@@ -471,7 +597,7 @@ def format_alarm_switches(switches: List[dict]) -> str:
     """
 
     if not switches:
-        return "无 / None"
+        return "无"
 
     chunks: List[str] = []
     for sw in switches:
@@ -480,6 +606,50 @@ def format_alarm_switches(switches: List[dict]) -> str:
             f"{alarm_label(sw['to'])} @ {sw['distance_m']:.2f}m"
         )
     return " ; ".join(chunks)
+
+
+def format_alarm_switches_html(switches: List[dict]) -> str:
+    """
+    Overview:
+    Render alarm switch records as an HTML mini-table for display in the report.
+
+    Input Parameters:
+    - switches (list[dict]): Alarm switch events, each with keys
+      'frame_id', 'from', 'to', 'distance_m'.
+
+    Return Values:
+    - str: HTML string containing a compact table of switch events,
+      or a plain "无 / None" string when there are no events.
+
+    Author: Kawhi.He
+    """
+    if not switches:
+        return "<strong>无</strong>"
+
+    rows = []
+    for sw in switches:
+        from_label = html.escape(alarm_label(sw['from']))
+        to_label   = html.escape(alarm_label(sw['to']))
+        rows.append(
+            f"<tr>"
+            f"<td>{sw['frame_id']}</td>"
+            f"<td>{from_label}</td>"
+            f"<td>{to_label}</td>"
+            f"<td>{sw['distance_m']:.2f} m</td>"
+            f"</tr>"
+        )
+    header = (
+        "<table class='switch-table'>"
+        "<thead><tr>"
+        "<th>帧号</th>"
+        "<th>切换前</th>"
+        "<th>切换后</th>"
+        "<th>距离</th>"
+        "</tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody>"
+        "</table>"
+    )
+    return header
 
 
 def analyze_alarm_in_cycle(cycle: List[Frame]) -> dict:
@@ -561,14 +731,29 @@ def analyze_cycles(frames: List[Frame]) -> dict:
     """
 
     cycles = split_object_cycles(frames)
+    frame_lookup = {f.frame_id: f for f in frames}
+
+    # Keep only e-bike cycles; skip pedestrian or other slow/close targets.
+    ebike_cycles = [c for c in cycles if is_ebike_cycle(c)]
+    filtered_count = len(cycles) - len(ebike_cycles)
+
+    sorted_cycles = sorted(
+        ebike_cycles,
+        key=lambda c: (
+            classify_motion_scene(c)[2],
+            c[0].frame_id,
+        ),
+    )
+
     cycle_results = []
 
-    for idx, cycle in enumerate(cycles, start=1):
+    for idx, cycle in enumerate(sorted_cycles, start=1):
+        scene_key, scene_label, _ = classify_motion_scene(cycle)
         object_dists = [abs(f.objects[0].dist_lat_m) for f in cycle if f.objects]
         farthest = max(object_dists) if object_dists else 0.0
 
         frame_drop_ids = missing_frame_ids_in_cycle(cycle)
-
+        frame_drop_set = set(frame_drop_ids)
         match_rows = []
         missing_point_frames: List[int] = []
         consecutive_missing_streak = 0
@@ -603,7 +788,58 @@ def analyze_cycles(frames: List[Frame]) -> dict:
             )
 
         launch_frames = infer_launch_frames(cycle, frames)
+        launch_start_frame = max(cycle[0].frame_id - launch_frames, 0)
+        display_start_frame = max(launch_start_frame - 2, 0)
         alarm_data = analyze_alarm_in_cycle(cycle)
+
+        row_by_frame = {r["frame_id"]: r for r in match_rows}
+        timeline_rows = []
+        for frame_id in range(display_start_frame, cycle[-1].frame_id + 1):
+            row = row_by_frame.get(frame_id)
+
+            if row is None:
+                row = {
+                    "frame_id": frame_id,
+                    "obj_dist_lat": None,
+                    "obj_dist_long": None,
+                    "obj_vre_lat": None,
+                    "obj_vre_long": None,
+                    "expected_angle_deg": None,
+                    "matched": False,
+                    "point_angle_deg": None,
+                }
+
+            status_tags: List[str] = []
+            frame_data = frame_lookup.get(frame_id)
+
+            if frame_id < launch_start_frame:
+                status_tags.append("建航前参考帧")
+            elif frame_id < cycle[0].frame_id:
+                if frame_data and frame_data.points:
+                    status_tags.append("建航阶段")
+                else:
+                    status_tags.append("建航前无点云")
+            else:
+                if frame_id in frame_drop_set:
+                    status_tags.append("目标丢失")
+                else:
+                    status_tags.append("目标存在")
+
+            if frame_id == cycle[0].frame_id:
+                status_tags.append("目标首次出现")
+
+            if frame_id in missing_point_frames:
+                status_tags.append("点云丢失")
+
+            if (
+                frame_id >= cycle[0].frame_id
+                and frame_id not in frame_drop_set
+                and row.get("matched")
+            ):
+                status_tags.append("点云匹配")
+
+            row["target_status"] = " | ".join(status_tags)
+            timeline_rows.append(row)
 
         cycle_results.append(
             {
@@ -611,13 +847,16 @@ def analyze_cycles(frames: List[Frame]) -> dict:
                 "start_frame": cycle[0].frame_id,
                 "end_frame": cycle[-1].frame_id,
                 "duration_frames": len(cycle),
+                "scene_key": scene_key,
+                "scene_label": scene_label,
                 "farthest_distance_m": farthest,
+                "launch_start_frame": launch_start_frame,
                 "object_frame_drops": frame_drop_ids,
                 "launch_frames": launch_frames,
                 "missing_point_frames": missing_point_frames,
                 "lost_events": lost_events,
                 "alarm": alarm_data,
-                "rows": match_rows,
+                "rows": timeline_rows,
             }
         )
 
@@ -625,10 +864,19 @@ def analyze_cycles(frames: List[Frame]) -> dict:
     if cycle_results:
         global_farthest = max(item["farthest_distance_m"] for item in cycle_results)
 
+    approaching = [c["farthest_distance_m"] for c in cycle_results if c["scene_key"] == "approaching"]
+    receding    = [c["farthest_distance_m"] for c in cycle_results if c["scene_key"] == "receding"]
+    global_farthest_approaching = max(approaching) if approaching else None
+    global_farthest_receding    = max(receding)    if receding    else None
+
     return {
         "frame_count": len(frames),
+        "total_cycle_count": len(cycles),
+        "filtered_cycle_count": filtered_count,
         "cycle_count": len(cycle_results),
         "global_farthest_distance_m": global_farthest,
+        "global_farthest_approaching_m": global_farthest_approaching,
+        "global_farthest_receding_m": global_farthest_receding,
         "cycles": cycle_results,
     }
 
@@ -646,7 +894,7 @@ def fmt_ids(ids: List[int]) -> str:
     """
 
     if not ids:
-        return "无 / None"
+        return "无"
     return ", ".join(str(x) for x in ids)
 
 
@@ -664,26 +912,72 @@ def render_html(data: dict, input_name: str) -> str:
     """
 
     cycle_blocks = []
+    frame_lookup = {f.frame_id: f for f in data.get("_frame_lookup", [])}
+
+    def fmt_num(value: float | None) -> str:
+        if value is None:
+            return "-"
+        return f"{value:.2f}"
+
+    def build_frame_detail_text(frame_id: int) -> str:
+        frame = frame_lookup.get(frame_id)
+        if frame is None:
+            return f"FrameID={frame_id}\nFrame not found in source data."
+
+        lines = [
+            f"FrameID={frame.frame_id}",
+            f"TimeStamp={frame.timestamp_ms:.0f}",
+            f"AlarmType={frame.alarm_type} ({alarm_label(frame.alarm_type)})",
+            f"PointNum={len(frame.points)}",
+            f"ObjectNum={len(frame.objects)}",
+            "[Point]",
+        ]
+
+        if frame.points:
+            for i, p in enumerate(frame.points, start=1):
+                lines.append(
+                    f"{i}:Range={p.range_m:.1f} Velocity={p.velocity_mps:.1f} "
+                    f"AngleAZ={p.angle_az_rad:.6f}"
+                )
+        else:
+            lines.append("None")
+
+        lines.append("[Object]")
+        if frame.objects:
+            for i, obj in enumerate(frame.objects, start=1):
+                lines.append(
+                    f"{i}:DistLat={obj.dist_lat_m:.1f} DistLong={obj.dist_long_m:.1f} "
+                    f"VreLat={obj.vre_lat_mps:.1f} VreLong={obj.vre_long_mps:.1f}"
+                )
+        else:
+            lines.append("None")
+
+        return "\n".join(lines)
 
     for c in data["cycles"]:
         rows_html = []
         for r in c["rows"]:
             point_angle = "-" if r["point_angle_deg"] is None else f"{r['point_angle_deg']:.2f}"
-            frame_alarm_type = next(
-                (f.alarm_type for f in data["_frame_lookup"] if f.frame_id == r["frame_id"]),
-                0,
-            )
+            frame_data = frame_lookup.get(r["frame_id"])
+            frame_alarm_type = frame_data.alarm_type if frame_data else 0
+            detail_text = html.escape(build_frame_detail_text(r["frame_id"]))
             rows_html.append(
                 "<tr>"
-                f"<td>{r['frame_id']}</td>"
-                f"<td>{r['obj_dist_lat']:.2f}</td>"
-                f"<td>{r['obj_dist_long']:.2f}</td>"
-                f"<td>{r['obj_vre_lat']:.2f}</td>"
-                f"<td>{r['obj_vre_long']:.2f}</td>"
-                f"<td>{r['expected_angle_deg']:.2f}</td>"
+                "<td>"
+                "<details class='frame-detail-inline'>"
+                f"<summary>{r['frame_id']}</summary>"
+                f"<pre>{detail_text}</pre>"
+                "</details>"
+                "</td>"
+                f"<td>{fmt_num(r['obj_dist_lat'])}</td>"
+                f"<td>{fmt_num(r['obj_dist_long'])}</td>"
+                f"<td>{fmt_num(r['obj_vre_lat'])}</td>"
+                f"<td>{fmt_num(r['obj_vre_long'])}</td>"
+                f"<td>{fmt_num(r['expected_angle_deg'])}</td>"
                 f"<td>{alarm_label(frame_alarm_type)}</td>"
-                f"<td>{'是 / Yes' if r['matched'] else '否 / No'}</td>"
+                f"<td>{'是' if r['matched'] else '否'}</td>"
                 f"<td>{point_angle}</td>"
+                f"<td>{html.escape(r['target_status'])}</td>"
                 "</tr>"
             )
 
@@ -691,50 +985,59 @@ def render_html(data: dict, input_name: str) -> str:
         alarm_start_frame = (
             str(alarm["alarm_start_frame"])
             if alarm["alarm_start_frame"] is not None
-            else "无 / None"
+            else "无"
         )
         farthest_alarm = (
             f"{alarm['farthest_alarm_distance_m']:.2f} m"
             if alarm["farthest_alarm_distance_m"] is not None
-            else "无 / None"
+            else "无"
         )
 
         cycle_blocks.append(
             f"""
-<section class=\"cycle\">
-    <h2>周期 / Cycle {c['cycle_index']} (帧 / Frame {c['start_frame']} - {c['end_frame']})</h2>
+<details class=\"cycle\">
+    <summary>
+        <span class=\"summary-title\">Cycle {c['cycle_index']}</span>
+        <span class=\"summary-meta\">{c['scene_label']} | 帧 {c['start_frame']} - {c['end_frame']}</span>
+    </summary>
+    <h2>Cycle {c['cycle_index']} (帧 {c['start_frame']} - {c['end_frame']})</h2>
   <div class=\"metrics\">
-        <div><span>持续帧数 / Duration</span><strong>{c['duration_frames']} 帧 / frames</strong></div>
-        <div><span>最远目标距离 / Farthest Object Distance</span><strong>{c['farthest_distance_m']:.2f} m</strong></div>
-        <div><span>目标中途丢帧 / Object Mid-Track Frame Drops</span><strong>{html.escape(fmt_ids(c['object_frame_drops']))}</strong></div>
-        <div><span>建航帧数（点云先于目标）/ Launch Frames (Point before Object)</span><strong>{c['launch_frames']}</strong></div>
-        <div><span>点云缺失帧 / Missing Point Frames</span><strong>{html.escape(fmt_ids(c['missing_point_frames']))}</strong></div>
-        <div><span>点云丢失事件（连续3帧）/ Point Lost Events (3 consecutive misses)</span><strong>{html.escape(fmt_ids(c['lost_events']))}</strong></div>
-                <div><span>报警起始帧 / Alarm Start Frame</span><strong>{alarm_start_frame}</strong></div>
-                <div><span>报警起始类型 / Alarm Start Type</span><strong>{alarm_label(alarm['alarm_start_type'])}</strong></div>
-                <div><span>最远报警距离 / Farthest Alarm Distance</span><strong>{farthest_alarm}</strong></div>
-                <div><span>丢失报警帧（应持续报警）/ Missing Alarm Frames</span><strong>{html.escape(fmt_ids(alarm['missing_alarm_frames']))}</strong></div>
-                <div><span>报警提示切换距离 / Alarm Switch Distance</span><strong>{html.escape(format_alarm_switches(alarm['alarm_switches']))}</strong></div>
+        <div><span>持续帧数</span><strong>{c['duration_frames']} 帧</strong></div>
+        <div><span>运动场景</span><strong>{c['scene_label']}</strong></div>
+        <div><span>建航起始帧</span><strong>{c['launch_start_frame']}</strong></div>
+        <div><span>最远目标距离</span><strong>{c['farthest_distance_m']:.2f} m</strong></div>
+        <div><span>目标中途丢帧</span><strong>{html.escape(fmt_ids(c['object_frame_drops']))}</strong></div>
+        <div><span>建航帧数（点云先于目标）</span><strong>{c['launch_frames']}</strong></div>
+        <div><span>点云缺失帧</span><strong>{html.escape(fmt_ids(c['missing_point_frames']))}</strong></div>
+        <div><span>点云丢失事件（连续3帧）</span><strong>{html.escape(fmt_ids(c['lost_events']))}</strong></div>
+                <div><span>报警起始帧</span><strong>{alarm_start_frame}</strong></div>
+                <div><span>报警起始类型</span><strong>{alarm_label(alarm['alarm_start_type'])}</strong></div>
+                <div><span>最远报警距离</span><strong>{farthest_alarm}</strong></div>
+                <div><span>丢失报警帧（应持续报警）</span><strong>{html.escape(fmt_ids(alarm['missing_alarm_frames']))}</strong></div>
+                <div class="metrics-full"><span>报警提示切换距离</span>{format_alarm_switches_html(alarm['alarm_switches'])}</div>
   </div>
-  <table>
+    <div class="table-wrap">
+    <table>
     <thead>
       <tr>
-                <th>帧号 / FrameID</th>
-                <th>目标纵向距离 / Obj DistLat (m)</th>
-                <th>目标横向距离 / Obj DistLong (m)</th>
-                <th>目标纵向速度 / Obj VreLat (m/s)</th>
-                <th>目标横向速度 / Obj VreLong (m/s)</th>
-                <th>目标相对角度 / Obj Angle vs Radar (deg)</th>
-                <th>报警提示 / Alarm Type</th>
-                <th>点云匹配 / Point Matched</th>
-                <th>匹配点方位角 / Matched Point AngleAZ (deg)</th>
+                <th>帧号</th>
+                <th>目标纵向距离 (m)</th>
+                <th>目标横向距离 (m)</th>
+                <th>目标纵向速度 (m/s)</th>
+                <th>目标横向速度 (m/s)</th>
+                <th>目标相对角度 (deg)</th>
+                <th>报警提示</th>
+                <th>点云匹配</th>
+                <th>匹配点方位角 (deg)</th>
+                <th>目标状态</th>
       </tr>
     </thead>
     <tbody>
       {''.join(rows_html)}
     </tbody>
-  </table>
-</section>
+    </table>
+    </div>
+</details>
 """
         )
 
@@ -744,7 +1047,7 @@ def render_html(data: dict, input_name: str) -> str:
     cycles_html = (
         "\n".join(cycle_blocks)
         if cycle_blocks
-        else "<p>未检测到目标数据 / No object data found.</p>"
+        else "<p>未检测到目标数据</p>"
     )
 
     return f"""<!DOCTYPE html>
@@ -752,91 +1055,204 @@ def render_html(data: dict, input_name: str) -> str:
 <head>
   <meta charset=\"UTF-8\" />
   <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />
-    <title>毫米波雷达分析报告 / Radar Analysis Report</title>
+    <title>毫米波雷达分析报告</title>
   <style>
     :root {{
-      --bg: #f7f8fa;
-      --panel: #ffffff;
-      --text: #1f2937;
-      --muted: #6b7280;
-      --line: #e5e7eb;
-      --accent: #0f766e;
-      --accent-soft: #ccfbf1;
-      --bad: #b91c1c;
+            --bg-1: #f6f8ef;
+            --bg-2: #e6eef6;
+            --bg-3: #f6efe7;
+            --panel: #ffffff;
+            --text: #15222c;
+            --muted: #5c6772;
+            --line: #d8dee6;
+            --accent: #0a7a6a;
+            --accent-2: #d04c2e;
+            --accent-soft: #daf6ee;
+            --bad: #b42318;
+            --shadow-lg: 0 20px 40px rgba(11, 31, 52, 0.10);
+            --shadow-md: 0 8px 22px rgba(11, 31, 52, 0.08);
     }}
     body {{
       margin: 0;
-      font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
-      background: linear-gradient(160deg, #f0fdfa 0%, var(--bg) 40%, #eef2ff 100%);
+            font-family: "Source Han Sans SC", "Noto Sans SC", "Microsoft YaHei", sans-serif;
+            background:
+                radial-gradient(circle at 5% 12%, rgba(10, 122, 106, 0.14), transparent 35%),
+                radial-gradient(circle at 92% 22%, rgba(208, 76, 46, 0.12), transparent 30%),
+                linear-gradient(140deg, var(--bg-1) 0%, var(--bg-2) 48%, var(--bg-3) 100%);
       color: var(--text);
+            min-height: 100vh;
     }}
     .container {{
-      max-width: 1200px;
-      margin: 24px auto;
-      padding: 0 16px 40px;
+            max-width: 1320px;
+            margin: 20px auto;
+            padding: 0 18px 44px;
     }}
     .header {{
-      background: var(--panel);
+            background: linear-gradient(145deg, rgba(255, 255, 255, 0.90), rgba(255, 255, 255, 0.72));
+            backdrop-filter: blur(8px);
       border: 1px solid var(--line);
-      border-radius: 14px;
-      padding: 20px;
-      box-shadow: 0 6px 24px rgba(15, 23, 42, 0.06);
+            border-radius: 18px;
+            padding: 22px;
+            box-shadow: var(--shadow-lg);
     }}
-    .header h1 {{ margin: 0 0 6px 0; font-size: 28px; }}
-    .header p {{ margin: 6px 0; color: var(--muted); }}
+        .header h1 {{
+            margin: 0 0 6px 0;
+            font-size: 31px;
+            letter-spacing: 0.4px;
+        }}
+        .header p {{ margin: 6px 0; color: var(--muted); }}
     .overview {{
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-      gap: 12px;
-      margin-top: 14px;
+            gap: 14px;
+            margin-top: 16px;
     }}
     .card {{
       border: 1px solid var(--line);
-      border-radius: 10px;
-      padding: 12px;
-      background: #fff;
+            border-radius: 14px;
+            padding: 13px;
+            background: linear-gradient(160deg, #ffffff 0%, #f8fbff 100%);
+            box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.8), var(--shadow-md);
     }}
     .card span {{ display: block; color: var(--muted); font-size: 12px; }}
-    .card strong {{ font-size: 20px; color: var(--accent); }}
+        .card strong {{ font-size: 22px; color: var(--accent); }}
     .cycle {{
-      margin-top: 18px;
-      background: var(--panel);
+            margin-top: 20px;
+            background: linear-gradient(165deg, #ffffff 0%, #fbfcfe 100%);
       border: 1px solid var(--line);
-      border-radius: 14px;
-      padding: 16px;
-      box-shadow: 0 4px 18px rgba(15, 23, 42, 0.05);
+            border-radius: 18px;
+            padding: 16px;
+            box-shadow: var(--shadow-md);
+            overflow: hidden;
+            animation: fadeSlide 0.42s ease both;
     }}
-    .cycle h2 {{ margin: 0 0 12px; font-size: 20px; }}
+        .cycle summary {{
+            cursor: pointer;
+            list-style: none;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+                        padding: 8px 4px 12px;
+                        border-bottom: 1px dashed #c8d2dc;
+                        margin-bottom: 12px;
+        }}
+        .cycle summary::-webkit-details-marker {{
+            display: none;
+        }}
+        .summary-title {{
+                        font-size: 20px;
+            font-weight: 700;
+            color: var(--accent);
+        }}
+        .summary-meta {{
+                        font-size: 13px;
+            color: var(--muted);
+                        padding: 4px 10px;
+                        border: 1px solid #dbe4ec;
+                        border-radius: 999px;
+                        background: rgba(255, 255, 255, 0.7);
+        }}
+        .cycle h2 {{ margin: 0 0 12px; font-size: 21px; }}
     .metrics {{
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-      gap: 10px;
-      margin-bottom: 12px;
+            grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+            gap: 12px;
+            margin-bottom: 14px;
     }}
     .metrics div {{
-      background: var(--accent-soft);
-      border-radius: 10px;
-      padding: 10px;
-      border: 1px solid #99f6e4;
+            background: linear-gradient(145deg, var(--accent-soft) 0%, #f2fcf8 100%);
+            border-radius: 12px;
+            padding: 10px 12px;
+            border: 1px solid #b7e9d8;
+    }}
+    .metrics-full {{
+            grid-column: 1 / -1;
     }}
     .metrics span {{ display: block; font-size: 12px; color: #115e59; }}
-    .metrics strong {{ font-size: 15px; }}
-    table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
-    th, td {{ border: 1px solid var(--line); padding: 8px; text-align: center; }}
-    th {{ background: #f9fafb; }}
+        .metrics strong {{ font-size: 15px; line-height: 1.35; }}
+    .switch-table {{
+            width: 100%; border-collapse: collapse; margin-top: 6px; font-size: 13px;
+    }}
+    .switch-table th {{
+            background: #d1fae5; color: #065f46; font-weight: 600;
+            padding: 4px 10px; border: 1px solid #a7f3d0; text-align: center;
+    }}
+    .switch-table td {{
+            padding: 4px 10px; border: 1px solid #a7f3d0; text-align: center; color: #1e293b;
+    }}
+    .switch-table tr:nth-child(even) td {{ background: #f0fdf8; }}
+        .table-wrap {{
+            overflow-x: auto;
+            border: 1px solid var(--line);
+            border-radius: 12px;
+            background: #fff;
+        }}
+        table {{ width: 100%; border-collapse: collapse; font-size: 13px; min-width: 1080px; }}
+        th, td {{ border: 1px solid var(--line); padding: 9px; text-align: center; }}
+        th {{
+            background: linear-gradient(180deg, #f8fafd 0%, #eef3f8 100%);
+            position: sticky;
+            top: 0;
+            z-index: 2;
+        }}
+        tbody tr:nth-child(even) {{ background: #fbfdff; }}
+        tbody tr:hover {{ background: #f1f8ff; }}
     .warn {{ color: var(--bad); font-weight: 600; }}
+        .frame-detail-inline {{ text-align: left; }}
+        .frame-detail-inline summary {{
+            cursor: pointer;
+                        color: var(--accent);
+            font-weight: 600;
+            list-style: none;
+                        display: inline-flex;
+                        align-items: center;
+                        gap: 6px;
+                        padding: 3px 8px;
+                        border-radius: 999px;
+                        border: 1px solid #c8dbd5;
+                        background: #f4fcf9;
+                        text-decoration: none;
+        }}
+        .frame-detail-inline pre {{
+            margin-top: 8px;
+            background: #f8fafc;
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            padding: 8px;
+            max-height: 280px;
+            overflow: auto;
+            white-space: pre;
+            font-size: 12px;
+        }}
+        @keyframes fadeSlide {{
+            from {{ opacity: 0; transform: translateY(8px); }}
+            to {{ opacity: 1; transform: translateY(0); }}
+        }}
+        @media (max-width: 768px) {{
+            .container {{ margin-top: 12px; padding: 0 10px 24px; }}
+            .header {{ padding: 16px; border-radius: 14px; }}
+            .header h1 {{ font-size: 22px; }}
+            .summary-title {{ font-size: 17px; }}
+            .summary-meta {{ font-size: 12px; }}
+            .cycle {{ padding: 12px; border-radius: 14px; }}
+            .metrics {{ grid-template-columns: 1fr; gap: 8px; }}
+        }}
   </style>
 </head>
 <body>
   <div class=\"container\">
     <div class=\"header\">
-            <h1>毫米波雷达测试报告 / Millimeter-Wave Radar Test Report</h1>
-            <p>输入文件 / Input File: {html.escape(input_name)}</p>
-            <p>规则说明 / Rules Applied: 帧连续性检查、点云与目标匹配、连续3帧缺失判定丢失 / frame continuity check, point/object matching, 3-frame point-loss rule.</p>
+            <h1>毫米波雷达测试报告</h1>
+            <p>输入文件: {html.escape(input_name)}</p>
+            <p>规则说明: 帧连续性检查、点云与目标匹配、连续3帧缺失判定丢失。</p>
       <div class=\"overview\">
-                <div class=\"card\"><span>总帧数 / Total Frames</span><strong>{data['frame_count']}</strong></div>
-                <div class=\"card\"><span>目标周期数 / Object Cycles</span><strong>{data['cycle_count']}</strong></div>
-                <div class=\"card\"><span>全局最远目标距离 / Global Farthest Object Distance</span><strong>{data['global_farthest_distance_m']:.2f} m</strong></div>
+                <div class=\"card\"><span>总帧数</span><strong>{data['frame_count']}</strong></div>
+                <div class="card"><span>检测到目标周期总数</span><strong>{data['total_cycle_count']}</strong></div>
+                <div class="card"><span>电瓶车目标周期数（25–50 km/h）</span><strong>{data['cycle_count']}</strong></div>
+                <div class="card"><span>被过滤周期数（行人等）</span><strong>{data['filtered_cycle_count']}</strong></div>
+                <div class=\"card\"><span>接近场景最远目标距离</span><strong>{ f"{data['global_farthest_approaching_m']:.2f} m" if data['global_farthest_approaching_m'] is not None else '无' }</strong></div>
+                <div class=\"card\"><span>远离场景最远目标距离</span><strong>{ f"{data['global_farthest_receding_m']:.2f} m" if data['global_farthest_receding_m'] is not None else '无' }</strong></div>
       </div>
     </div>
     {cycles_html}
