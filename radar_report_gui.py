@@ -40,7 +40,6 @@ class RadarReportApp:
         self.root.minsize(720, 320)
 
         self.input_var = tk.StringVar()
-        self.output_var = tk.StringVar()
         self.status_var = tk.StringVar(value="请先选择 frame.txt 文件 / Please select frame.txt first")
 
         self._build_ui()
@@ -82,16 +81,6 @@ class RadarReportApp:
         )
         ttk.Button(file_card, text="选择文件 / Browse", command=self.select_input).grid(
             row=1, column=1, padx=(8, 0), pady=2
-        )
-
-        ttk.Label(file_card, text="报告输出路径 / Output report path:").grid(
-            row=2, column=0, sticky=tk.W, padx=(0, 8), pady=(10, 6)
-        )
-        ttk.Entry(file_card, textvariable=self.output_var, width=78).grid(
-            row=3, column=0, sticky=tk.EW, pady=2
-        )
-        ttk.Button(file_card, text="选择路径 / Save As", command=self.select_output).grid(
-            row=3, column=1, padx=(8, 0), pady=2
         )
 
         file_card.columnconfigure(0, weight=1)
@@ -142,34 +131,7 @@ class RadarReportApp:
 
         in_path = Path(path)
         self.input_var.set(str(in_path))
-
-        if not self.output_var.get().strip():
-            self.output_var.set(str(in_path.with_name("report.html")))
-
         self.status_var.set("已选择输入文件 / Input file selected")
-
-    def select_output(self) -> None:
-        """
-        Overview:
-        Select output report path.
-
-        Input Parameters:
-        - None.
-
-        Return Values:
-        - None.
-        """
-
-        path = filedialog.asksaveasfilename(
-            title="选择报告保存路径 / Select report output path",
-            defaultextension=".html",
-            filetypes=[("HTML files", "*.html"), ("All files", "*.*")],
-        )
-        if not path:
-            return
-
-        self.output_var.set(path)
-        self.status_var.set("已设置输出路径 / Output path set")
 
     def generate_report(self) -> None:
         """
@@ -184,7 +146,6 @@ class RadarReportApp:
         """
 
         input_text = self.input_var.get().strip()
-        output_text = self.output_var.get().strip()
 
         if not input_text:
             messagebox.showwarning(
@@ -193,12 +154,8 @@ class RadarReportApp:
             )
             return
 
-        if not output_text:
-            output_text = str(Path(input_text).with_name("report.html"))
-            self.output_var.set(output_text)
-
         input_path = Path(input_text)
-        output_path = Path(output_text)
+        output_path = input_path.with_name("report.html")
 
         if not input_path.exists():
             messagebox.showerror(

@@ -28,11 +28,11 @@ HEAD_RE = re.compile(r"^\s*([A-Za-z]+)=([\-\d\.nan]+)\s*$")
 
 # ---------------------------------------------------------------------------
 # E-bike target filter thresholds
-# E-bike speed: 25–50 km/h  =>  6.94–13.89 m/s
+# E-bike speed: 15-60 km/h  =>  4.17-16.67 m/s
 # Target must have first appeared at least this far away (meters).
 # ---------------------------------------------------------------------------
-EBIKE_MIN_SPEED_MPS: float = 25.0 / 3.6   # ~6.94 m/s
-EBIKE_MAX_SPEED_MPS: float = 50.0 / 3.6   # ~13.89 m/s
+EBIKE_MIN_SPEED_MPS: float = 15.0 / 3.6   # ~4.17 m/s
+EBIKE_MAX_SPEED_MPS: float = 60.0 / 3.6   # ~16.67 m/s
 EBIKE_MIN_APPEAR_DIST_M: float = 10.0     # first object distance threshold
 POINT_RE = re.compile(
     r"^\s*\d+:Range=([\-\d\.]+)\s+Velocity=([\-\d\.]+)\s+"
@@ -531,16 +531,19 @@ def classify_motion_scene(cycle: List[Frame]) -> tuple[str, str, int]:
             inc += 1
 
     overall = dists[-1] - dists[0]
+    # In this dataset convention, increasing |DistLat| indicates target moving
+    # toward the ego lane/host context, while decreasing |DistLat| indicates
+    # moving away. Keep labels aligned with test-scene expectations.
     if dec >= inc and overall < -eps:
-        return ("approaching", "接近场景", 0)
-    if inc > dec and overall > eps:
         return ("receding", "远离场景", 1)
+    if inc > dec and overall > eps:
+        return ("approaching", "接近场景", 0)
 
     # Fallback by start/end change direction.
     if overall < 0:
-        return ("approaching", "接近场景", 0)
-    if overall > 0:
         return ("receding", "远离场景", 1)
+    if overall > 0:
+        return ("approaching", "接近场景", 0)
     return ("unknown", "趋势不明确", 2)
 
 
@@ -608,7 +611,7 @@ def format_alarm_switches(switches: List[dict]) -> str:
     return " ; ".join(chunks)
 
 
-def format_alarm_switches_html(switches: List[dict]) -> str:
+def format_alarm_switches_html(switches: List[dict], detail_fn=None) -> str:
     """
     Overview:
     Render alarm switch records as an HTML mini-table for display in the report.
@@ -630,9 +633,19 @@ def format_alarm_switches_html(switches: List[dict]) -> str:
     for sw in switches:
         from_label = html.escape(alarm_label(sw['from']))
         to_label   = html.escape(alarm_label(sw['to']))
+        if detail_fn is not None:
+            detail_text = html.escape(detail_fn(sw['frame_id']))
+            frame_cell = (
+                f"<details class='frame-detail-inline'>"
+                f"<summary>{sw['frame_id']}</summary>"
+                f"<pre>{detail_text}</pre>"
+                f"</details>"
+            )
+        else:
+            frame_cell = str(sw['frame_id'])
         rows.append(
             f"<tr>"
-            f"<td>{sw['frame_id']}</td>"
+            f"<td style='text-align:left'>{frame_cell}</td>"
             f"<td>{from_label}</td>"
             f"<td>{to_label}</td>"
             f"<td>{sw['distance_m']:.2f} m</td>"
@@ -1014,7 +1027,7 @@ def render_html(data: dict, input_name: str) -> str:
                 <div><span>报警起始类型</span><strong>{alarm_label(alarm['alarm_start_type'])}</strong></div>
                 <div><span>最远报警距离</span><strong>{farthest_alarm}</strong></div>
                 <div><span>丢失报警帧（应持续报警）</span><strong>{html.escape(fmt_ids(alarm['missing_alarm_frames']))}</strong></div>
-                <div class="metrics-full"><span>报警提示切换距离</span>{format_alarm_switches_html(alarm['alarm_switches'])}</div>
+                <div class="metrics-full"><span>报警提示切换距离</span>{format_alarm_switches_html(alarm['alarm_switches'], build_frame_detail_text)}</div>
   </div>
     <div class="table-wrap">
     <table>
@@ -1249,7 +1262,7 @@ def render_html(data: dict, input_name: str) -> str:
       <div class=\"overview\">
                 <div class=\"card\"><span>总帧数</span><strong>{data['frame_count']}</strong></div>
                 <div class="card"><span>检测到目标周期总数</span><strong>{data['total_cycle_count']}</strong></div>
-                <div class="card"><span>电瓶车目标周期数（25–50 km/h）</span><strong>{data['cycle_count']}</strong></div>
+                <div class="card"><span>电瓶车目标周期数（15-60 km/h）</span><strong>{data['cycle_count']}</strong></div>
                 <div class="card"><span>被过滤周期数（行人等）</span><strong>{data['filtered_cycle_count']}</strong></div>
                 <div class=\"card\"><span>接近场景最远目标距离</span><strong>{ f"{data['global_farthest_approaching_m']:.2f} m" if data['global_farthest_approaching_m'] is not None else '无' }</strong></div>
                 <div class=\"card\"><span>远离场景最远目标距离</span><strong>{ f"{data['global_farthest_receding_m']:.2f} m" if data['global_farthest_receding_m'] is not None else '无' }</strong></div>
