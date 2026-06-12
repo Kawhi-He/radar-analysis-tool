@@ -16,8 +16,22 @@
 
 ## Python 脚本
 
+### 核心分析工具
 - 主分析脚本：[generate_radar_report.py](generate_radar_report.py)
 - GUI 入口脚本：[radar_report_gui.py](radar_report_gui.py)
+- 点云分析脚本：[generate_pointcloud_report.py](generate_pointcloud_report.py)
+- 点云分析 GUI：[pointcloud_analysis_gui.py](pointcloud_analysis_gui.py)
+- 点云连续丢帧分析 GUI：[pointcloud_loss_gui.py](pointcloud_loss_gui.py)
+- 功率地图 GUI：[power_map_gui.py](power_map_gui.py)
+- 跟踪报告生成器：[tracking_report_generator.py](tracking_report_generator.py)
+- 跟踪报告 GUI：[tracking_report_gui.py](tracking_report_gui.py)
+
+### 辅助工具
+- 保活工具：[keep_awake_tool.py](keep_awake_tool.py)
+- 雷达检测功率绘制：[plot_radar_detection_power.py](plot_radar_detection_power.py)
+- 有效范围损耗计算：[compute_effect_range_loss.py](compute_effect_range_loss.py)
+- 距离角度偏移汇总：[summarize_distance_angle_offsets.py](summarize_distance_angle_offsets.py)
+- 调试工具：[_debug_gap.py](_debug_gap.py)
 
 ### 命令行生成报告
 
@@ -25,10 +39,36 @@
 python .\generate_radar_report.py -i .\frame.txt -o .\report.html
 ```
 
+### 点云分析命令行
+
+动态目标：
+
+```powershell
+python .\generate_pointcloud_report.py --mode dynamic --rcs 10 --dynamic-speed-value 5 --dynamic-speed-unit m/s --scene-mode 接近 -i .\frame.txt -o .\pointcloud_report_dynamic.html
+```
+
+静态目标：
+
+```powershell
+python .\generate_pointcloud_report.py --mode static --rcs 10 --distance 30 --speed-value 5 --speed-unit m/s -i .\frame.txt -o .\pointcloud_report_static.html
+```
+
 ## GUI 使用方式
 
 ```powershell
 python .\radar_report_gui.py
+```
+
+点云分析 GUI：
+
+```powershell
+python .\pointcloud_analysis_gui.py
+```
+
+点云连续三帧丢失最远距离 GUI：
+
+```powershell
+python .\pointcloud_loss_gui.py
 ```
 
 界面流程：
